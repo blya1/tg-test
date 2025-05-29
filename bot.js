@@ -1,3 +1,171 @@
+const { Telegraf } = require('telegraf');
+const { createClient } = require('@supabase/supabase-js');
+const axios = require('axios');
+const express = require('express');
+const rateLimit = require('express-rate-limit');
+const winston = require('winston');
+const dotenv = require('dotenv');
+
+dotenv.config();
+
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = process.env.ADMIN_ID;
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+const PORT = process.env.PORT || 3000;
+const WEBHOOK_URL = process.env.WEBHOOK_URL;
+
+const bot = new Telegraf(BOT_TOKEN);
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+const app = express();
+
+// Настройка логирования
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.File({ filename: 'error.log', level: 'error' }),
+        new winston.transports.File({ filename: 'combined.log' })
+    ]
+});
+
+if (process.env.NODE_ENV !== 'production') {
+    logger.add(new winston.transports.Console({
+        format: winston.format.simple()
+    }));
+}
+
+// Middleware для обработки JSON
+app.use(express.json());
+
+// Настройка rate limiting
+const limiter = rateLimit({
+    windowMs: 15 * 60 * 1000, // 15 минут
+    max: 100, // Ограничение 100 запросов на IP за окно
+    message: 'Слишком много запросов, попробуйте позже.'
+});
+
+app.use(limiter);
+
+// Настройка вебхука
+const WEBHOOK_PATH = '/secret-webhook-path';
+app.use(bot.webhookCallback(WEBHOOK_PATH));
+
+// Установка вебхука
+bot.telegram.setWebhook(WEBHOOK_URL).then(() => {
+    logger.info('Webhook установлен:', { url: WEBHOOK_URL });
+}).catch(error => {
+    logger.error('Ошибка установки вебхука:', { error: error.message });
+});
+
+const sanitizeFileName = (name) => {
+    return name
+        .replace(/[^a-zA-Z0-9-_]/g, '')
+        .substring(0, 50) || 'user';
+};
+
+const userState = {};
+
+bot.start((ctx) => {
+    ctx.reply('Привет, студент! Как тебя зовут?');
+    userState[ctx.from.id] = { step: 'waitingForName', chatId: ctx.chat.id };
+});
+
+bot.command('restart', (ctx) => {
+    if (ctx.from.id.toString() !== ADMIN_ID) {
+        ctx.reply('У вас нет прав для перезапуска бота.');
+        return;
+    }
+    ctx.reply('Перезапускаю бота...');
+    setTimeout(() => {
+        logger.info('Бот перезапускается...');
+        process.exit(0);
+    }, 1000);
+});
+
+bot.on('text', async (ctx) => {
+    const userId = ctx.from.id;
+    const state = userState[userId];
+
+    if (!state) {
+        ctx.reply('Пожалуйста, начни с команды /start.');
+        return;
+    }
+
+    if (state.step === 'waitingForName') {
+        state.client = ctx.message.text;
+        ctx.reply(`Привет, ${state.client}! Отправь фото или файл с информацией LMS. https://lms.tuit.uz/student/info`);
+        state.step = 'waitingForPhoto';
+    }
+});
+
+// Обработчик для фото и документов
+bot.on(['photo', 'document'], async (ctx) => {
+    const userId = ctx.from.id;
+    const state = userState[userId];
+
+    if (state && state.step === 'waitingForPhoto') {
+        let fileId;
+        let fileName;
+
+        if (ctx.message.photo) {
+            const photo = ctx.message.photo.pop();
+            fileId = photo.file_id;
+            fileName = `${Date.now()}-${sanitizeFileName(state.client)}.jpg`;
+        } else if (ctx.message.document && ctx.message.document.mime_type.startsWith('image/')) {
+            fileId = ctx.message.document.file_id;
+            fileName = `${Date.now()}-${sanitizeFileName(state.client)}-${ctx.message.document.file_name || 'image.jpg'}`;
+        } else {
+            ctx.reply('Пожалуйста, отправь изображение в формате фото или файла (JPG, PNG).');
+            return;
+        }
+
+        try {
+            const fileUrl = await ctx.telegram.getFileLink(fileId);
+            const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
+            const buffer = Buffer.from(response.data);
+
+            logger.info('Загружаем файл:', { fileName });
+            const { data, error: uploadError } = await supabase.storage
+                .from('photos')
+                .upload(fileName, buffer, { contentType: 'image/jpeg' });
+
+            if (uploadError) throw uploadError;
+            const photoUrl = supabase.storage.from('photos').getPublicUrl(fileName).data.publicUrl;
+
+            logger.info('Публичная ссылка на файл:', { photoUrl });
+            if (!photoUrl) throw new Error('Failed to get public URL.');
+
+            const { error: dbError } = await supabase
+                .from('orders')
+                .insert({
+                    client: state.client,
+                    url: '',
+                    photo_url: photoUrl,
+                    amount: 300000,
+                    status: 'Ожидание',
+                    chat_id: state.chatId
+                });
+
+            if (dbError) throw dbError;
+
+            // Уведомление администратору
+            await bot.telegram.sendMessage(ADMIN_ID, `Новый заказ от ${state.client}:\nФото: ${photoUrl}`);
+
+            ctx.reply('Фото успешно сохранено! Ожидай подтверждения.');
+            delete userState[userId];
+        } catch (error) {
+            logger.error('Ошибка:', { error: error.message, userId });
+            ctx.reply('Произошла ошибка при сохранении файла. Попробуй снова.');
+        }
+    } else {
+        ctx.reply('Сначала начни с команды /start и укажи своё имя!');
+    }
+});
+
 bot.on('callback_query', async (ctx) => {
     const userId = ctx.from.id;
     const state = userState[userId];
@@ -109,4 +277,16 @@ bot.on('callback_query', async (ctx) => {
         }
         return ctx.answerCbQuery();
     }
+});
+
+
+// Глобальный обработчик ошибок
+bot.catch((err, ctx) => {
+    logger.error('Ошибка в обработчике:', { error: err.message, userId: ctx?.from?.id, stack: err.stack });
+    ctx.reply('Произошла ошибка. Пожалуйста, попробуйте снова или обратитесь к администратору.');
+});
+
+// Запуск сервера
+app.listen(PORT, () => {
+    logger.info(`Сервер запущен на порту ${PORT}`);
 });
