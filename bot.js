@@ -97,53 +97,77 @@ bot.on('text', async (ctx) => {
 
     if (state.step === 'waitingForName') {
         state.client = ctx.message.text;
-        ctx.reply(`Привет, ${state.client}! Отправь фото с информацией LMS. https://lms.tuit.uz/student/info`);
+        ctx.reply(`Привет, ${state.client}! Отправь фото или файл с информацией LMS. https://lms.tuit.uz/student/info`);
         state.step = 'waitingForPhoto';
     }
 });
 
-bot.on('photo', async (ctx) => {
+// Обработчик для фото и документов
+bot.on(['photo', 'document'], async (ctx) => {
     const userId = ctx.from.id;
     const state = userState[userId];
 
     if (state && state.step === 'waitingForPhoto') {
-        const photo = ctx.message.photo.pop();
-        const fileId = photo.file_id;
+        let fileId;
+        let fileName;
+
+        if (ctx.message.photo) {
+            const photo = ctx.message.photo.pop();
+            fileId = photo.file_id;
+            fileName = `${Date.now()}-${sanitizeFileName(state.client)}.jpg`;
+        } else if (ctx.message.document && ctx.message.document.mime_type.startsWith('image/')) {
+            fileId = ctx.message.document.file_id;
+            fileName = `${Date.now()}-${sanitizeFileName(state.client)}-${ctx.message.document.file_name || 'image.jpg'}`;
+        } else {
+            ctx.reply('Пожалуйста, отправь изображение в формате фото или файла (JPG, PNG).');
+            return;
+        }
+
         try {
             const fileUrl = await ctx.telegram.getFileLink(fileId);
             const response = await axios.get(fileUrl, { responseType: 'arraybuffer' });
-            state.buffer = Buffer.from(response.data);
+            const buffer = Buffer.from(response.data);
 
-            state.step = 'selectingMonth';
-            state.dateTime = { month: null, day: null, hour: null, minute: null };
+            logger.info('Загружаем файл:', { fileName });
+            const { data, error: uploadError } = await supabase.storage
+                .from('photos')
+                .upload(fileName, buffer, { contentType: 'image/jpeg' });
 
-            const months = [
-                ['01', '02', '03'],
-                ['04', '05', '06'],
-                ['07', '08', '09'],
-                ['10', '11', '12']
-            ];
+            if (uploadError) throw uploadError;
+            const photoUrl = supabase.storage.from('photos').getPublicUrl(fileName).data.publicUrl;
 
-            ctx.reply('Фото получено! Выбери месяц:', {
-                reply_markup: {
-                    inline_keyboard: months.map(row =>
-                        row.map(month => ({
-                            text: month,
-                            callback_data: `month_${month}`
-                        }))
-                    )
-                }
-            });
-            logger.info('Фото успешно загружено', { userId, fileId });
+            logger.info('Публичная ссылка на файл:', { photoUrl });
+            if (!photoUrl) throw new Error('Failed to get public URL.');
+
+            const { error: dbError } = await supabase
+                .from('orders')
+                .insert({
+                    client: state.client,
+                    url: '',
+                    photo_url: photoUrl,
+                    amount: 300000,
+                    status: 'Ожидание',
+                    chat_id: state.chatId
+                });
+
+            if (dbError) throw dbError;
+
+            // Уведомление администратору
+            await bot.telegram.sendMessage(ADMIN_ID, `Новый заказ от ${state.client}:\nФото: ${photoUrl}`);
+
+            ctx.reply('Фото успешно сохранено! Ожидай подтверждения.');
+            delete userState[userId];
         } catch (error) {
-            logger.error('Ошибка загрузки фото:', { error: error.message, userId });
-            ctx.reply('Ошибка при загрузке фото. Попробуй снова.');
+            logger.error('Ошибка:', { error: error.message, userId });
+            ctx.reply('Произошла ошибка при сохранении файла. Попробуй снова.');
         }
     } else {
         ctx.reply('Сначала начни с команды /start и укажи своё имя!');
     }
 });
 
+/*
+// Закомментированная функциональность бронирования сессий
 bot.on('callback_query', async (ctx) => {
     const userId = ctx.from.id;
     const state = userState[userId];
@@ -245,7 +269,6 @@ bot.on('callback_query', async (ctx) => {
 
             if (dbError) throw dbError;
 
-            // Уведомление администратору
             await bot.telegram.sendMessage(ADMIN_ID, `Новый заказ от ${state.client}:\nДата: ${dateTime}\nФото: ${photoUrl}`);
 
             ctx.reply('Фото и заказ успешно сохранены! Ожидай подтверждения.');
@@ -257,6 +280,7 @@ bot.on('callback_query', async (ctx) => {
         return ctx.answerCbQuery();
     }
 });
+*/
 
 // Глобальный обработчик ошибок
 bot.catch((err, ctx) => {
