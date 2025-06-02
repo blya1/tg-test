@@ -111,8 +111,14 @@ const processImage = async (ctx, fileId) => {
 };
 
 bot.start((ctx) => {
+    const userId = ctx.from.id;
+    const username = ctx.from.username || 'NoUsername'; // Сохраняем username или 'NoUsername', если не задан
+    userState[userId] = { 
+        step: 'waitingForName', 
+        chatId: ctx.chat.id,
+        username: username // Сохраняем username в userState
+    };
     ctx.reply('Привет, студент! Как тебя зовут?');
-    userState[ctx.from.id] = { step: 'waitingForName', chatId: ctx.chat.id };
 });
 
 bot.command('restart', (ctx) => {
@@ -272,6 +278,7 @@ bot.on('callback_query', async (ctx) => {
                 .from('orders')
                 .insert({
                     client: state.client,
+                    username: state.username, // Добавляем username в запись
                     url: '',
                     photo_url: photoUrl,
                     amount: 300000,
@@ -282,8 +289,8 @@ bot.on('callback_query', async (ctx) => {
 
             if (dbError) throw dbError;
 
-            // Уведомление администратору
-            await bot.telegram.sendMessage(ADMIN_ID, `Новый заказ от ${state.client}:\nДата: ${dateTime}\nФото: ${photoUrl}`);
+            // Уведомление администратору с именем и username
+            await bot.telegram.sendMessage(ADMIN_ID, `Новый заказ от ${state.client} (${state.username}):\nДата: ${dateTime}\nФото: ${photoUrl}`);
 
             ctx.reply('Фото и заказ успешно сохранены! Ожидай подтверждения.');
             delete userState[userId];
